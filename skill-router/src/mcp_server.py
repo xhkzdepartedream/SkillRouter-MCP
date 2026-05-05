@@ -25,7 +25,6 @@ Configure in ~/.claude/settings.json:
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from pathlib import Path
@@ -44,8 +43,15 @@ _router: SkillRouter | None = None
 def get_router() -> SkillRouter:
     global _router
     if _router is None:
-        skills_dir = os.environ.get("SKILLS_DIR") or str(Path.home() / "skills_pool")
-        _router = SkillRouter(skills_dir=skills_dir)
+        # Redirect print → stderr so model-loading logs don't corrupt
+        # the JSON-RPC protocol (stdout = MCP data channel).
+        old_stdout = sys.stdout
+        sys.stdout = sys.stderr
+        try:
+            skills_dir = os.environ.get("SKILLS_DIR") or str(Path.home() / "skills_pool")
+            _router = SkillRouter(skills_dir=skills_dir)
+        finally:
+            sys.stdout = old_stdout
     return _router
 
 
@@ -133,3 +139,70 @@ async def open_skill(name: str) -> str:
         f"**内容**:\n```\n{skill['body']}\n```",
     ]
     return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    import anyio
+    import anyio.lowlevel
+    from contextlib import asynccontextmanager
+    from mcp.types import JSONRPCMessage
+    from mcp.server.session import SessionMessage
+
+    @asynccontextmanager
+    async def _stdio_transport():
+        """Bypass mcp.stdio_server's TextIOWrapper bug on Python 3.13.
+
+        Uses binary streams directly instead of wrapping with TextIOWrapper,
+        which breaks under Python 3.13 when connected via subprocess PIPE.
+        """
+        stdin_bin = sys.stdin.buffer
+        stdout_bin = sys.stdout.buffer
+
+        async with anyio.wrap_file(stdin_bin) as stdin, \
+                   anyio.wrap_file(stdout_bin) as stdout:
+            read_writer, read_stream = anyio.create_memory_object_stream(0)
+            write_stream, write_reader = anyio.create_memory_object_stream(0)
+
+            async def _reader():
+                try:
+                    async with read_writer:
+                        async for line in stdin:
+                            line = line.decode("utf-8").strip()
+                            if not line:
+                                continue
+                            try:
+                                msg = JSONRPCMessage.model_validate_json(line)
+                            except Exception as exc:
+                                await read_writer.send(exc)
+                                continue
+                            await read_writer.send(SessionMessage(msg))
+                except anyio.ClosedResourceError:
+                    await anyio.lowlevel.checkpoint()
+
+            async def _writer():
+                try:
+                    async with write_reader:
+                        async for sm in write_reader:
+                            data = sm.message.model_dump_json(
+                                by_alias=True, exclude_none=True
+                            )
+                            await stdout.write((data + "\n").encode("utf-8"))
+                            await stdout.flush()
+                except anyio.ClosedResourceError:
+                    await anyio.lowlevel.checkpoint()
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(_reader)
+                tg.start_soon(_writer)
+                yield read_stream, write_stream
+
+    async def _main():
+        """Standalone entry: custom stdio transport + MCP server run loop."""
+        async with _stdio_transport() as (read_stream, write_stream):
+            await app._mcp_server.run(
+                read_stream,
+                write_stream,
+                app._mcp_server.create_initialization_options(),
+            )
+
+    anyio.run(_main)
